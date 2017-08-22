@@ -30,6 +30,8 @@ LOCAL_SRC_FILES := \
 	nav_status_packet.cpp \
 	time_helper.cpp \
 	mcu_client_helper.cpp \
+	event_loop.cpp \
+	circle_buffer.cpp \
 	gnss_device.cpp
 
 #LOCAL_CFLAGS := \

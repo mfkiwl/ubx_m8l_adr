@@ -27,14 +27,197 @@
 #include "cfg_esfwt_packet.h"
 #include "nav_status_packet.h"
 #include "time_helper.h"
-#include "mcu_client_helper.h"
 
 const int GnssDevice::TIMEOUT = 100;
 
+int GnssDevice::CalibrationEventListener::onTimeOut() {
+    return 0;
+}
+int GnssDevice::CalibrationEventListener::onReadEvent() {
+    int len = 0;
+    len = read(this->device->fd,
+        this->device->rbuf + this->device->index,
+        (BUF_SIZE - this->device->index));
+    std::cout << "read :" << len << "errno:" << strerror(errno) << std::endl;
+    if (0 >= len) return -1;
+    this->device->index += len;
+    this->device->showReadBuffer();
+
+    Packet* ret = Packet::findPacket(this->device->rbuf, this->device->index);
+    if (ret->type == UNKNOWN) {
+        goto next_read;
+    }
+
+    if (ret->type == KNOWN) {
+        if (ret->status == NOT_COMPLETE) goto next_read_not_move;
+        if (ret->status == COMPLETE) {
+            goto next_read;
+        }
+        std::cout << "find error packet.\n" << std::endl;
+        memset(this->device->rbuf, 0, this->device->index);
+        this->device->index = 0;
+        return -1;
+    }
+
+    std::cout << ret->toString() << std::endl;
+    std::cout << ret->showBuffer() << std::endl;
+
+    //find ALG/STATUS packet
+    if (ret->type == UBX_ESF_ALG) {
+        AlgPacket* pAlg = (AlgPacket*)ret;
+        //print ALG/STATUS packet
+        //check calibration stauts
+        if (pAlg->algStatus == ALG_CALIBRATED) {
+            //if calibrated, stop
+            std::cout << "Device: " << this->device->serial << " has calibrated.\n" << std::endl;
+            this->device->calib = true;
+            this->device->eventLoop.stop();
+        }
+    }
+
+    if (ret->type == UBX_ESF_STATUS) {
+        EsfStatusPacket *pStatus = (EsfStatusPacket*)ret;
+        if (pStatus->mntAlgStatus == MNT_INITED) {
+            std::cout << "Device: " << this->device->serial << " has calibrated.\n" << std::endl;
+            this->device->calib = true;
+            this->device->eventLoop.stop();
+        }
+    }
+
+next_read:
+    if (this->device->index > ret->len)
+        memcpy(this->device->rbuf, this->device->rbuf + ret->len, this->device->index - ret->len);
+    this->device->index -= ret->len;
+next_read_not_move:
+    ret->clear();
+    delete ret;
+    return 0;
+}
+int GnssDevice::CalibrationEventListener::onWriteEvent() {
+    return 0;
+}
+
+int GnssDevice::ADREventListener::onTimeOut() {
+    //if timeout
+    std::cout << "time out." << std::endl;
+    //get speed and direction data from mcu service.
+    int speed = this->device->client->getSpeed();
+    bool forward = this->device->client->getForward();
+    std::cout << "speed: " << speed << ", forward: " << forward << std::endl;
+    //create esf meas packet
+    EsfMeasPacket* meas = (EsfMeasPacket*) Packet::createPacket(UBX_ESF_MEAS);
+    meas->setMeasData(SPEED, forward, speed);
+    this->device->latestTimeTick = TimeHelper::getMonoTick();
+    meas->timeTag = (unsigned int)this->device->latestTimeTick;
+    meas->encode();
+    std::cout << meas->showBuffer() << std::endl;
+    std::cout << meas->toString();
+    //write esf meas packet to chip
+    if (0 >= write(this->fd, meas->start, meas->len)) return -1;
+    meas->clear();
+    delete meas;
+    meas = NULL;
+    this->device->eventLoop.setTimeout(GnssDevice::TIMEOUT);
+    return 0;
+}
+
+int GnssDevice::ADREventListener::onReadEvent() {
+    long long currentTime = TimeHelper::getMonoTick();
+    unsigned int timeout = 0;
+    //read serial
+    int len = read(this->device->fd, this->device->rbuf + this->device->index, (BUF_SIZE - this->device->index));
+    if (0 >= len) {
+        timeout = GnssDevice::TIMEOUT - (TimeHelper::getMonoTick() - this->device->latestTimeTick);
+        if (0 > timeout) timeout = GnssDevice::TIMEOUT;
+        this->device->latestTimeTick = TimeHelper::getMonoTick();
+        this->device->eventLoop.setTimeout(timeout);
+        return -1;
+    }
+    this->device->index += len;
+    this->device->showReadBuffer();
+
+    int dealIndex = 0;
+    bool dealAll = false;
+    Packet* ret = nullptr;
+    while (!dealAll) {
+        std::cout << "dealIndex: " << dealIndex << ", index: " <<this->device->index << std::endl;
+        ret = Packet::findPacket(this->device->rbuf + dealIndex, this->device->index - dealIndex);
+        if (ret->type == UNKNOWN) {
+            goto next_deal;
+        }
+
+        if (ret->type == KNOWN) {
+            if (ret->status == NOT_COMPLETE) {
+                break; //next read
+            }
+            if (ret->status == COMPLETE) {
+                goto next_deal;
+            }
+            std::cout << "find error packet.\n" << std::endl;
+            memset(this->device->rbuf, 0, this->device->index);
+            this->device->index = 0;
+            timeout = GnssDevice::TIMEOUT - (TimeHelper::getMonoTick() - this->device->latestTimeTick);
+            this->device->eventLoop.setTimeout(timeout);
+            this->device->latestTimeTick = TimeHelper::getMonoTick();
+            ret->clear();
+            delete ret;
+            return -1;
+        }
+
+        std::cout << ret->toString() << std::endl;
+        std::cout << ret->showBuffer() << std::endl;
+        //find nav status packet
+        if (ret->type == UBX_NAV_STATUS) {
+            NavStatusPacket* nav = (NavStatusPacket*) ret;
+            if (GPS_FIX_DR_ONLY == nav->fixMode ||
+                    GPS_FIX_DR_COMBIN == nav->fixMode) {
+                std::cout << "ADR has works." << std::endl;
+            }
+        }
+        //check fix mode if ADR works
+        //calculate timeout time.
+next_deal:
+        dealIndex += ret->len;
+        ret->clear();
+        delete ret;
+        if (dealIndex >= this->device->index) {
+            this->device->index = 0;
+            timeout = GnssDevice::TIMEOUT - (TimeHelper::getMonoTick() - this->device->latestTimeTick);
+            if (0 > timeout) timeout = GnssDevice::TIMEOUT;
+            std::cout << "new time out is " << timeout << std::endl;
+            this->device->latestTimeTick = TimeHelper::getMonoTick();
+            this->device->eventLoop.setTimeout(timeout);
+            dealAll = true;
+        }
+    }
+
+    //dealIndex += ret->len;
+    if (dealIndex < this->device->index) {
+        memcpy(this->device->rbuf, this->device->rbuf + dealIndex, (this->device->index - dealIndex));
+    }
+    this->device->index -= dealIndex;
+    std::cout << "next read index: " << this->device->index << std::endl;
+    timeout = GnssDevice::TIMEOUT - (TimeHelper::getMonoTick() - this->device->latestTimeTick);
+    if (0 > timeout) timeout = GnssDevice::TIMEOUT;
+    std::cout << "new time out is " << timeout << std::endl;
+    this->device->latestTimeTick = TimeHelper::getMonoTick();
+    this->device->eventLoop.setTimeout(timeout);
+    if (nullptr != ret) {
+        ret->clear();
+        delete ret;
+    }
+
+    return 0;
+}
+
+int GnssDevice::ADREventListener::onWriteEvent() {
+    return 0;
+}
 GnssDevice::GnssDevice(std::string ser, int band) :
     serial(ser), ttyband(band), fd(0), mode(GNSS_STOP),
     yaw(0), pitch(0), roll(0),
-    index(0), flagOfLever(0), needStop(false){
+    index(0), flagOfLever(0), needStop(false), eventLoop(),
+    latestTimeTick(0) {
     memset(rbuf, 0, BUF_SIZE);
     memset(levers, 0, sizeof(levers));
     if (115200 != band && 9600 != band) return;
@@ -48,6 +231,7 @@ GnssDevice::GnssDevice(std::string ser, int band) :
     close(this->fd);
     this->fd = 0;
     this->mode = GNSS_OPEN;
+    this->client = McuClientHelper::create();
 }
 
 int GnssDevice::setSensorLever(EsfLaSensorType type, short armx,
@@ -257,7 +441,10 @@ int GnssDevice::calibrate() {
     //write auto calibration command to chip
     if (0 != startAutoCalib()) return -1;
 
-#if 1 // don't do calibration.
+    this->eventLoop.clear();
+    this->eventLoop.addEventListener(new CalibrationEventListener(this, this->fd));
+    this->eventLoop.start();
+#if 0 // don't do calibration.
     int epollfd = 0;
     int nfds = 0;
     struct epoll_event ev;
@@ -356,9 +543,6 @@ next_read_not_move:
 #endif
     this->calib = true;
     return 0;
-
-    //else return -4;
-    return -4;
 }
 
 int GnssDevice::setSensorMountAngles(short yaw, short pitch, short roll) {
@@ -413,6 +597,12 @@ int GnssDevice::startADR() {
     //config esfwt to use speed
     if (0 != configADR()) return -1;
 
+    this->latestTimeTick = TimeHelper::getMonoTick();
+    this->eventLoop.clear();
+    this->eventLoop.setTimeout(GnssDevice::TIMEOUT);
+    this->eventLoop.addEventListener(new ADREventListener(this, this->fd));
+    this->eventLoop.start();
+#if 0
     int epollfd = 0;
     int nfds = 0;
     struct epoll_event ev;
@@ -560,6 +750,7 @@ adr_next_read:
             }
         }
     }
+#endif
     return 0;
 }
 

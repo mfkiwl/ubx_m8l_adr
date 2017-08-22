@@ -10,6 +10,8 @@
 
 #include "packet.h"
 #include "esfla_sensor.h"
+#include "event_loop.h"
+#include "mcu_client_helper.h"
 
 typedef enum GnssDeviceMode {
     GNSS_STOP = 0,
@@ -38,6 +40,33 @@ protected:
     int configADR();
     void showReadBuffer();
 
+    class CalibrationEventListener: public EventListener {
+        public:
+        int onTimeOut();
+        int onReadEvent();
+        int onWriteEvent();
+        CalibrationEventListener(GnssDevice* dev, int fd) : EventListener(fd, EVENT_READ),
+            device(dev) {}
+
+        private:
+        GnssDevice* device;
+    };
+
+    class ADREventListener: public EventListener {
+        public:
+        int onTimeOut();
+        int onReadEvent();
+        int onWriteEvent();
+        ADREventListener(GnssDevice* dev, int fd) : EventListener(fd, EVENT_TIMEOUT | EVENT_READ),
+            device(dev) {}
+
+        private:
+        GnssDevice* device;
+    };
+
+    friend class CalibrationEventListener;
+    friend class ADREventListener;
+
 private:
     int fd;
     std::string serial;
@@ -54,5 +83,10 @@ private:
     bool calib;
     volatile bool needStop;
     static const int TIMEOUT;
+    EventLoop eventLoop;
+    sp<McuClientHelper> client;
+    long long latestTimeTick;
+    //CalibrationEventListener calibrationEventListener;
+    //ADREventListener adrEventListener;
 };
 #endif //_GNSS_DEVICE_H_
