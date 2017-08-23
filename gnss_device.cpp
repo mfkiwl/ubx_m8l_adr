@@ -181,12 +181,12 @@ next_deal:
         ret->clear();
         delete ret;
         if (dealIndex >= this->device->index) {
-            this->device->index = 0;
+            /*this->device->index = 0;
             timeout = GnssDevice::TIMEOUT - (TimeHelper::getMonoTick() - this->device->latestTimeTick);
             if (0 > timeout) timeout = GnssDevice::TIMEOUT;
             std::cout << "new time out is " << timeout << std::endl;
             this->device->latestTimeTick = TimeHelper::getMonoTick();
-            this->device->eventLoop.setTimeout(timeout);
+            this->device->eventLoop.setTimeout(timeout);*/
             dealAll = true;
         }
     }
