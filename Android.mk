@@ -61,7 +61,8 @@ include $(CLEAR_VARS)
 LOCAL_MODULE := calibration
 LOCAL_SHARED_LIBRARIES := libadr libstlport
 LOCAL_C_INCLUDES +=  external/stlport/stlport \
-					 bionic
+					 bionic \
+					 frameworks/base/libs/carinfo_client/
 
 LOCAL_CFLAGS += -std=c++11
 LOCAL_SRC_FILES := adr_auto_cal.cpp
